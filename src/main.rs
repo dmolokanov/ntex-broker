@@ -162,6 +162,10 @@ fn control_v3(
                 }
                 v3::ControlPacket::Closed(closed) => {
                     // TODO close session
+                    let client_id = session.state().client_id();
+                    sessions.close_session(&client_id);
+                    log::info!("Client {} closed connection", client_id);
+
                     future::ok(closed.ack())
                 }
             }
