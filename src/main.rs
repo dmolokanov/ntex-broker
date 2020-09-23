@@ -5,7 +5,10 @@ use ntex::ServiceFactory;
 use ntex_mqtt::{v3, v5, MqttServer};
 use v3::QoS;
 
-use ntex_broker::{MqttSession, Publication, QualityOfService, SessionManager};
+use ntex_broker::{
+    Publication, QualityOfService, SessionLite, SessionManagerHandle, SessionManagerWorker,
+};
+use tokio::sync::mpsc;
 
 #[derive(Debug)]
 struct ServerError;
@@ -25,152 +28,173 @@ impl std::convert::TryFrom<ServerError> for v5::PublishAck {
 }
 
 fn publish_v3(
-    sessions: &SessionManager,
+    sessions: SessionManagerHandle,
 ) -> impl ServiceFactory<
-    Config = v3::Session<MqttSession>,
+    Config = v3::Session<SessionLite>,
     Request = v3::Publish,
     Response = (),
     Error = ServerError,
     InitError = ServerError,
 > {
-    let sessions = sessions.clone();
-
     ntex::fn_factory(move || {
         let sessions = sessions.clone();
         future::ok(ntex::fn_service(move |publish: v3::Publish| {
-            let qos = match publish.qos() {
-                QoS::AtMostOnce => QualityOfService::AtMostOnce,
-                QoS::AtLeastOnce => QualityOfService::AtLeastOnce,
-                QoS::ExactlyOnce => QualityOfService::AtLeastOnce,
-            };
+            let sessions = sessions.clone();
+            async move {
+                let qos = match publish.qos() {
+                    QoS::AtMostOnce => QualityOfService::AtMostOnce,
+                    _ => QualityOfService::AtLeastOnce,
+                };
 
-            for (qos, session) in sessions.filter(publish.publish_topic(), qos) {
-                let publication = Publication::new(
-                    &publish.packet().topic,
-                    qos,
-                    publish.retain(),
-                    publish.payload(),
-                );
+                for (qos, session) in sessions.filter(publish.publish_topic(), qos).await {
+                    let publication = Publication::new(
+                        &publish.packet().topic,
+                        qos,
+                        publish.retain(),
+                        publish.payload(),
+                    );
 
-                session.publish(publication).expect("publish to session")
+                    if session.publish(publication).is_err() {
+                        panic!("publish to session");
+                    }
+                }
+
+                Ok(())
             }
-
-            future::ok(())
         }))
     })
 }
 
 fn connect_v3<Io>(
-    sessions: &SessionManager,
+    sessions: SessionManagerHandle,
 ) -> impl ServiceFactory<
     Config = (),
     Request = v3::Connect<Io>,
-    Response = v3::ConnectAck<Io, MqttSession>,
+    Response = v3::ConnectAck<Io, SessionLite>,
     Error = ServerError,
     InitError = ServerError,
 > {
-    let sessions = sessions.clone();
-
     ntex::fn_factory(move || {
         let sessions = sessions.clone();
         future::ok(ntex::fn_service(move |connect: v3::Connect<Io>| {
-            let client_id = connect.packet().client_id.clone();
+            let sessions = sessions.clone();
 
-            let (tx, mut rx) = ntex::channel::mpsc::channel::<Publication>();
+            async move {
+                let client_id = connect.packet().client_id.clone();
 
-            let session = sessions.open_session(&client_id, tx);
-            log::info!("Client {} connected", client_id);
+                let (tx, mut rx) = mpsc::unbounded_channel::<Publication>();
 
-            let sink = connect.sink().clone();
+                let session = sessions.open_session(client_id.clone(), tx).await;
+                log::info!("Client {} connected", client_id);
 
-            ntex::rt::spawn(async move {
-                while let Some(publication) = rx.next().await {
-                    let (topic, qos, retain, payload) = publication.into_parts();
-                    let mut publisher = sink.publish(topic, payload);
+                let sink = connect.sink().clone();
 
-                    if retain {
-                        publisher = publisher.retain();
-                    }
+                ntex::rt::spawn(async move {
+                    while let Some(publication) = rx.next().await {
+                        let (topic, qos, retain, payload) = publication.into_parts();
+                        let mut publisher = sink.publish(topic, payload);
 
-                    match qos {
-                        QualityOfService::AtMostOnce => publisher.send_at_most_once(),
-                        QualityOfService::AtLeastOnce => {
-                            if let Err(e) = publisher.send_at_least_once().await {
-                                log::error!("unable to send publish. {}", e);
+                        if retain {
+                            publisher = publisher.retain();
+                        }
+
+                        match qos {
+                            QualityOfService::AtMostOnce => publisher.send_at_most_once(),
+                            QualityOfService::AtLeastOnce => {
+                                if let Err(e) = publisher.send_at_least_once().await {
+                                    log::error!("unable to send publish. {}", e);
+                                }
                             }
                         }
                     }
-                }
 
-                log::info!("Sink worker for {} stopped", client_id);
-            });
+                    log::info!("Sink worker for {} stopped", client_id);
+                });
 
-            future::ok(connect.ack(session, false))
+                Ok(connect.ack(session, false))
+            }
         }))
     })
 }
 
 fn control_v3(
-    sessions: &SessionManager,
+    sessions: SessionManagerHandle,
 ) -> impl ServiceFactory<
-    Config = v3::Session<MqttSession>,
+    Config = v3::Session<SessionLite>,
     Request = v3::ControlPacket,
     Response = v3::ControlResult,
     Error = ServerError,
     InitError = ServerError,
 > {
-    let sessions = sessions.clone();
-
-    ntex::fn_factory_with_config(move |session: v3::Session<MqttSession>| {
+    ntex::fn_factory_with_config(move |session: v3::Session<SessionLite>| {
         let sessions = sessions.clone();
 
         future::ok(ntex::fn_service(move |req: v3::ControlPacket| {
-            match req {
-                v3::ControlPacket::Subscribe(mut subscribe) => {
-                    for mut sub in subscribe.iter_mut() {
-                        let qos = match sub.qos() {
-                            QoS::AtMostOnce => QualityOfService::AtMostOnce,
-                            QoS::AtLeastOnce => QualityOfService::AtLeastOnce,
-                            QoS::ExactlyOnce => {
-                                return future::err(ServerError); //todo refactor to separate error
-                            }
-                        };
+            let session = session.clone();
+            let sessions = sessions.clone();
 
-                        match session.state().subscribe(sub.topic(), qos) {
-                            Ok(_) => {
-                                sub.subscribe(sub.qos());
-                            }
-                            Err(_) => {
-                                return future::err(ServerError); //todo refactor to separate error
+            async move {
+                match req {
+                    v3::ControlPacket::Subscribe(mut subscribe) => {
+                        let subs = subscribe
+                            .iter_mut()
+                            .map(|sub| (sub.topic().clone(), from_qos(sub.qos())))
+                            .collect();
+
+                        if let Some(acks) =
+                            sessions.subscribe(session.state().client_id(), subs).await
+                        {
+                            for (mut sub, ack) in subscribe.iter_mut().zip(acks) {
+                                match ack {
+                                    Ok(qos) => sub.subscribe(to_qos(qos)),
+                                    Err(e) => {
+                                        panic!("error in topic filter {} {:?}", sub.topic(), e)
+                                    }
+                                }
                             }
                         }
+
+                        Ok(subscribe.ack())
                     }
-                    future::ok(subscribe.ack())
-                }
-                v3::ControlPacket::Unsubscribe(unsub) => {
-                    // todo unsubscribe
-                    future::ok(unsub.ack())
-                }
-                v3::ControlPacket::Ping(ping) => future::ok(ping.ack()),
-                v3::ControlPacket::Disconnect(disconnect) => {
-                    // TODO close session
-                    let client_id = session.state().client_id();
-                    sessions.close_session(&client_id);
-                    log::info!("Client {} disconnected", client_id);
+                    v3::ControlPacket::Unsubscribe(unsub) => {
+                        // todo unsubscribe
+                        Ok(unsub.ack())
+                    }
+                    v3::ControlPacket::Ping(ping) => Ok(ping.ack()),
+                    v3::ControlPacket::Disconnect(disconnect) => {
+                        // TODO close session
+                        let client_id = session.state().client_id();
+                        sessions.close_session(client_id.clone()).await;
+                        log::info!("Client {} disconnected", client_id);
 
-                    future::ok(disconnect.ack())
-                }
-                v3::ControlPacket::Closed(closed) => {
-                    // TODO close session
-                    let client_id = session.state().client_id();
-                    sessions.close_session(&client_id);
-                    log::info!("Client {} closed connection", client_id);
+                        Ok(disconnect.ack())
+                    }
+                    v3::ControlPacket::Closed(closed) => {
+                        // TODO close session
+                        let client_id = session.state().client_id();
+                        sessions.close_session(client_id.clone()).await;
+                        log::info!("Client {} closed connection", client_id);
 
-                    future::ok(closed.ack())
+                        Ok(closed.ack())
+                    }
                 }
             }
         }))
     })
+}
+
+fn to_qos(qos: QualityOfService) -> QoS {
+    match qos {
+        QualityOfService::AtMostOnce => QoS::AtMostOnce,
+        QualityOfService::AtLeastOnce => QoS::AtLeastOnce,
+    }
+}
+
+fn from_qos(qos: QoS) -> QualityOfService {
+    match qos {
+        QoS::AtMostOnce => QualityOfService::AtMostOnce,
+        _ => QualityOfService::AtLeastOnce,
+    }
 }
 
 #[ntex::main]
@@ -179,19 +203,19 @@ async fn main() -> std::io::Result<()> {
 
     env_logger::init();
 
-    ntex::server::Server::build()
-        .bind("mqtt", "127.0.0.1:1883", || {
-            // WARNING session manager is per thread!
-            let sessions = SessionManager::new();
+    let sessions = SessionManagerWorker::new();
+    let handle = sessions.handle();
 
+    ntex::rt::spawn(sessions.run());
+
+    ntex::server::Server::build()
+        .bind("mqtt", "127.0.0.1:1883", move || {
             MqttServer::new().v3({
-                v3::MqttServer::new(connect_v3(&sessions))
-                    .publish(publish_v3(&sessions))
-                    .control(control_v3(&sessions))
+                v3::MqttServer::new(connect_v3(handle.clone()))
+                    .publish(publish_v3(handle.clone()))
+                    .control(control_v3(handle.clone()))
             })
-            // .v5(v5::MqttServer::new(connect_v5).publish(publish_v5))
         })?
-        .workers(1)
         .run()
         .await
 }

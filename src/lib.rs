@@ -3,7 +3,7 @@ mod session;
 use bytes::Bytes;
 use bytestring::ByteString;
 
-pub use session::{MqttSession, SessionManager};
+pub use session::{SessionLite, SessionManager, SessionManagerHandle, SessionManagerWorker};
 
 pub struct Publication {
     topic: ByteString,

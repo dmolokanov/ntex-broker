@@ -2,24 +2,30 @@ use std::{cell::RefCell, cmp, rc::Rc};
 
 use bytestring::ByteString;
 use fxhash::FxHashMap;
-use ntex::channel::mpsc::{SendError, Sender};
 use ntex_mqtt::{v3::codec::TopicError, Topic};
+use tokio::{
+    stream::StreamExt,
+    sync::{
+        mpsc::{self, error::SendError, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
+};
 
 use crate::{Publication, QualityOfService};
 
-struct MqttSessionInner {
+struct SessionInner {
     client_id: ByteString,
     subscriptions: FxHashMap<ByteString, Subscription>,
-    sender: Sender<Publication>,
+    sender: UnboundedSender<Publication>,
 }
 
 #[derive(Clone)]
-pub struct MqttSession(Rc<RefCell<MqttSessionInner>>);
+pub struct Session(Rc<RefCell<SessionInner>>);
 
-impl MqttSession {
-    pub fn new(client_id: &ByteString, sender: Sender<Publication>) -> Self {
-        Self(Rc::new(RefCell::new(MqttSessionInner {
-            client_id: client_id.clone(),
+impl Session {
+    pub fn new(client_id: ByteString, sender: UnboundedSender<Publication>) -> Self {
+        Self(Rc::new(RefCell::new(SessionInner {
+            client_id,
             sender,
             subscriptions: Default::default(),
         })))
@@ -29,20 +35,24 @@ impl MqttSession {
         self.0.borrow().client_id.clone()
     }
 
+    fn sender(&self) -> UnboundedSender<Publication> {
+        self.0.borrow().sender.clone()
+    }
+
     pub fn subscribe(
         &self,
         filter: &ByteString,
         qos: QualityOfService,
-    ) -> Result<bool, TopicError> {
+    ) -> Result<QualityOfService, TopicError> {
         let mut inner = self.0.borrow_mut();
         if inner.subscriptions.contains_key(filter) {
-            Ok(false)
+            Ok(qos)
         } else {
             let topic = filter.parse()?;
             let subscription = Subscription::new(topic, qos);
             inner.subscriptions.insert(filter.clone(), subscription);
 
-            Ok(true)
+            Ok(qos)
         }
     }
 
@@ -60,10 +70,6 @@ impl MqttSession {
                 acc.map(|qos| cmp::max(qos, cmp::min(sub.max_qos(), publication_qos)))
                     .or_else(|| Some(cmp::min(sub.max_qos(), publication_qos)))
             })
-    }
-
-    pub fn publish(&self, publication: Publication) -> Result<(), SendError<Publication>> {
-        self.0.borrow_mut().sender.send(publication)
     }
 }
 
@@ -91,7 +97,7 @@ impl Subscription {
 
 #[derive(Default)]
 struct SessionManagerInner {
-    sessions: FxHashMap<ByteString, MqttSession>,
+    sessions: FxHashMap<ByteString, Session>,
 }
 
 #[derive(Clone, Default)]
@@ -102,31 +108,226 @@ impl SessionManager {
         Self::default()
     }
 
-    pub fn open_session(&self, client_id: &ByteString, sender: Sender<Publication>) -> MqttSession {
+    pub fn open_session(
+        &self,
+        client_id: ByteString,
+        sender: UnboundedSender<Publication>,
+    ) -> Session {
         let mut inner = self.0.borrow_mut();
-        let _existing = inner.sessions.remove(client_id);
+        let _existing = inner.sessions.remove(&client_id);
         // let _existing = sessions.remove(client_id);
 
-        let session = MqttSession::new(client_id, sender);
-        inner.sessions.insert(client_id.clone(), session.clone());
+        let session = Session::new(client_id.clone(), sender);
+        inner.sessions.insert(client_id, session.clone());
         session
     }
 
-    pub fn close_session(&self, client_id: &ByteString) -> Option<MqttSession> {
+    pub fn close_session(&self, client_id: ByteString) -> Option<Session> {
         let mut inner = self.0.borrow_mut();
-        inner.sessions.remove(client_id)
+        inner.sessions.remove(&client_id)
+    }
+
+    pub fn subscribe(
+        &self,
+        client_id: ByteString,
+        subscribe_to: Vec<(ByteString, QualityOfService)>,
+    ) -> Option<Vec<Result<QualityOfService, TopicError>>> {
+        let mut inner = self.0.borrow_mut();
+
+        inner.sessions.get_mut(&client_id).map(|session| {
+            subscribe_to
+                .into_iter()
+                .map(|(topic, qos)| session.subscribe(&topic, qos))
+                .collect()
+        })
     }
 
     pub fn filter(
         &self,
         topic: &str,
         qos: QualityOfService,
-    ) -> Vec<(QualityOfService, MqttSession)> {
+    ) -> Vec<(QualityOfService, SessionLite)> {
         self.0
             .borrow()
             .sessions
             .values()
-            .filter_map(|session| session.filter(topic, qos).map(|qos| (qos, session.clone())))
+            .filter_map(|session| {
+                session
+                    .filter(topic, qos)
+                    .map(|qos| (qos, SessionLite::from_session(session)))
+            })
             .collect()
+    }
+}
+
+pub struct SessionManagerWorker {
+    sender: UnboundedSender<SessionRequest>,
+    commands: UnboundedReceiver<SessionRequest>,
+}
+
+impl Default for SessionManagerWorker {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            sender: tx,
+            commands: rx,
+        }
+    }
+}
+
+impl SessionManagerWorker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn handle(&self) -> SessionManagerHandle {
+        SessionManagerHandle(self.sender.clone())
+    }
+
+    pub async fn run(mut self) {
+        let sessions = SessionManager::new();
+
+        while let Some(cmd) = self.commands.next().await {
+            match cmd {
+                SessionRequest::OpenSession {
+                    client_id,
+                    sender,
+                    ack,
+                } => {
+                    let session = sessions.open_session(client_id, sender);
+                    let session = SessionLite::from_session(&session);
+                    if ack.send(session).is_err() {
+                        log::error!("open_session cannot be sent",)
+                    }
+                }
+                SessionRequest::CloseSession { client_id, ack } => {
+                    let session = sessions.close_session(client_id);
+                    let session = session.map(|session| SessionLite::from_session(&session));
+                    if ack.send(session).is_err() {
+                        log::error!("close_session cannot be sent");
+                    }
+                }
+                SessionRequest::Subscribe {
+                    client_id,
+                    subscribe_to,
+                    ack,
+                } => {
+                    let acks = sessions.subscribe(client_id, subscribe_to);
+                    if ack.send(acks).is_err() {
+                        log::error!("subscribe cannot be sent");
+                    }
+                }
+                SessionRequest::Filter { topic, qos, ack } => {
+                    let senders = sessions.filter(&topic, qos);
+                    if ack.send(senders).is_err() {
+                        log::error!("filter cannot be sent");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionManagerHandle(UnboundedSender<SessionRequest>);
+
+impl SessionManagerHandle {
+    pub async fn open_session(
+        &self,
+        client_id: ByteString,
+        sender: UnboundedSender<Publication>,
+    ) -> SessionLite {
+        let (ack, rx) = oneshot::channel();
+
+        let req = SessionRequest::OpenSession {
+            client_id,
+            sender,
+            ack,
+        };
+        self.0.send(req);
+
+        rx.await.unwrap()
+    }
+
+    pub async fn close_session(&self, client_id: ByteString) -> Option<SessionLite> {
+        let (ack, rx) = oneshot::channel();
+
+        self.0.send(SessionRequest::CloseSession { client_id, ack });
+
+        rx.await.unwrap()
+    }
+
+    pub async fn subscribe(
+        &self,
+        client_id: ByteString,
+        subscribe_to: Vec<(ByteString, QualityOfService)>,
+    ) -> Option<Vec<Result<QualityOfService, TopicError>>> {
+        let (ack, rx) = oneshot::channel();
+
+        self.0.send(SessionRequest::Subscribe {
+            client_id,
+            subscribe_to,
+            ack,
+        });
+
+        rx.await.unwrap()
+    }
+
+    pub async fn filter(
+        &self,
+        topic: &str,
+        qos: QualityOfService,
+    ) -> Vec<(QualityOfService, SessionLite)> {
+        let (ack, rx) = oneshot::channel();
+
+        let topic = topic.into();
+        self.0.send(SessionRequest::Filter { topic, qos, ack });
+
+        rx.await.unwrap()
+    }
+}
+
+enum SessionRequest {
+    OpenSession {
+        client_id: ByteString,
+        sender: UnboundedSender<Publication>,
+        ack: oneshot::Sender<SessionLite>,
+    },
+    CloseSession {
+        client_id: ByteString,
+        ack: oneshot::Sender<Option<SessionLite>>,
+    },
+    Subscribe {
+        client_id: ByteString,
+        subscribe_to: Vec<(ByteString, QualityOfService)>,
+        ack: oneshot::Sender<Option<Vec<Result<QualityOfService, TopicError>>>>,
+    },
+    Filter {
+        topic: String,
+        qos: QualityOfService,
+        ack: oneshot::Sender<Vec<(QualityOfService, SessionLite)>>,
+    },
+}
+
+pub struct SessionLite {
+    client_id: ByteString,
+    sender: UnboundedSender<Publication>,
+}
+
+impl SessionLite {
+    pub fn new(client_id: ByteString, sender: UnboundedSender<Publication>) -> Self {
+        Self { client_id, sender }
+    }
+
+    pub fn from_session(session: &Session) -> Self {
+        Self::new(session.client_id(), session.sender())
+    }
+
+    pub fn client_id(&self) -> ByteString {
+        self.client_id.clone()
+    }
+
+    pub fn publish(&self, publication: Publication) -> Result<(), SendError<Publication>> {
+        self.sender.send(publication)
     }
 }
