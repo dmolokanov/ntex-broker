@@ -1,12 +1,10 @@
 #![type_length_limit = "152202854"]
 
 use futures_util::{future, StreamExt};
-use ntex::{server::Server, ServiceFactory};
-use ntex_mqtt::{v3, v5, MqttServer};
-use v3::QoS;
-
+use ntex::{channel::mpsc, server::Server, ServiceFactory};
 use ntex_broker::{Publication, QualityOfService, Session, SessionManager};
-use tokio::sync::{broadcast::RecvError, mpsc};
+use ntex_mqtt::{v3, v5, MqttServer};
+use tokio::sync::broadcast::RecvError;
 
 #[derive(Debug)]
 struct ServerError;
@@ -40,7 +38,7 @@ fn publish_v3(
             let sessions = sessions.clone();
             async move {
                 let qos = match publish.qos() {
-                    QoS::AtMostOnce => QualityOfService::AtMostOnce,
+                    v3::QoS::AtMostOnce => QualityOfService::AtMostOnce,
                     _ => QualityOfService::AtLeastOnce,
                 };
 
@@ -76,7 +74,7 @@ fn connect_v3<Io>(
             async move {
                 let client_id = connect.packet().client_id.clone();
 
-                let (tx, mut rx) = mpsc::unbounded_channel::<Publication>();
+                let (tx, mut rx) = mpsc::channel();
 
                 let session = sessions.open_session(client_id.clone(), tx);
                 log::info!("Client {} connected", client_id);
@@ -181,16 +179,16 @@ fn control_v3(
     })
 }
 
-fn to_qos(qos: QualityOfService) -> QoS {
+fn to_qos(qos: QualityOfService) -> v3::QoS {
     match qos {
-        QualityOfService::AtMostOnce => QoS::AtMostOnce,
-        QualityOfService::AtLeastOnce => QoS::AtLeastOnce,
+        QualityOfService::AtMostOnce => v3::QoS::AtMostOnce,
+        QualityOfService::AtLeastOnce => v3::QoS::AtLeastOnce,
     }
 }
 
-fn from_qos(qos: QoS) -> QualityOfService {
+fn from_qos(qos: v3::QoS) -> QualityOfService {
     match qos {
-        QoS::AtMostOnce => QualityOfService::AtMostOnce,
+        v3::QoS::AtMostOnce => QualityOfService::AtMostOnce,
         _ => QualityOfService::AtLeastOnce,
     }
 }
@@ -247,9 +245,10 @@ fn make_session_manager(sender: tokio::sync::broadcast::Sender<Publication>) -> 
     manager
 }
 
-// [ ] make a session manager per thread
-// [ ] maintain a session locally
-// [ ] when publish don't make a filter but a publist
-// [ ] publish first makes a broadcast to session manager on other threads
+// [x] make a session manager per thread
+// [x] maintain a session locally
+// [x] when publish don't make a filter but a publish
+// [x] publish first makes a broadcast to session manager on other threads
 //     then matches topics and dispatch packets to appropriate sinks
+// [x] since sinks are for local sessions, we can use ntex::channel
 // [ ] make inversed search index { Topic -> [Session] }
