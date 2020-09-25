@@ -91,6 +91,11 @@ fn connect_v3<Io>(
 
                 ntex::rt::spawn(async move {
                     while let Some(publication) = rx.next().await {
+                        if sink.ready().await.is_err() {
+                            log::warn!("Connection is closed");
+                            break;
+                        }
+
                         let (topic, qos, retain, payload) = publication.into_parts();
                         let mut publisher = sink.publish(topic, payload);
 
@@ -102,7 +107,7 @@ fn connect_v3<Io>(
                             QualityOfService::AtMostOnce => publisher.send_at_most_once(),
                             QualityOfService::AtLeastOnce => {
                                 if let Err(e) = publisher.send_at_least_once().await {
-                                    log::error!("unable to send publish. {}", e);
+                                    log::error!("Unable to send publish. {}", e);
                                 }
                             }
                         }
