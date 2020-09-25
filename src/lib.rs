@@ -3,8 +3,9 @@ mod session;
 use bytes::Bytes;
 use bytestring::ByteString;
 
-pub use session::{SessionLite, SessionManager, SessionManagerHandle, SessionManagerWorker};
+pub use session::{Session, SessionManager};
 
+#[derive(Clone)]
 pub struct Publication {
     topic: ByteString,
     qos: QualityOfService,

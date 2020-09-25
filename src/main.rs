@@ -1,14 +1,12 @@
 #![type_length_limit = "152202854"]
 
 use futures_util::{future, StreamExt};
-use ntex::ServiceFactory;
+use ntex::{server::Server, ServiceFactory};
 use ntex_mqtt::{v3, v5, MqttServer};
 use v3::QoS;
 
-use ntex_broker::{
-    Publication, QualityOfService, SessionLite, SessionManagerHandle, SessionManagerWorker,
-};
-use tokio::sync::mpsc;
+use ntex_broker::{Publication, QualityOfService, Session, SessionManager};
+use tokio::sync::{broadcast::RecvError, mpsc};
 
 #[derive(Debug)]
 struct ServerError;
@@ -28,9 +26,9 @@ impl std::convert::TryFrom<ServerError> for v5::PublishAck {
 }
 
 fn publish_v3(
-    sessions: SessionManagerHandle,
+    sessions: SessionManager,
 ) -> impl ServiceFactory<
-    Config = v3::Session<SessionLite>,
+    Config = v3::Session<Session>,
     Request = v3::Publish,
     Response = (),
     Error = ServerError,
@@ -46,18 +44,14 @@ fn publish_v3(
                     _ => QualityOfService::AtLeastOnce,
                 };
 
-                for (qos, session) in sessions.filter(publish.publish_topic(), qos).await {
-                    let publication = Publication::new(
-                        &publish.packet().topic,
-                        qos,
-                        publish.retain(),
-                        publish.payload(),
-                    );
+                let publication = Publication::new(
+                    &publish.packet().topic,
+                    qos,
+                    publish.retain(),
+                    publish.payload(),
+                );
 
-                    if session.publish(publication).is_err() {
-                        panic!("publish to session");
-                    }
-                }
+                sessions.publish(publication);
 
                 Ok(())
             }
@@ -66,11 +60,11 @@ fn publish_v3(
 }
 
 fn connect_v3<Io>(
-    sessions: SessionManagerHandle,
+    sessions: SessionManager,
 ) -> impl ServiceFactory<
     Config = (),
     Request = v3::Connect<Io>,
-    Response = v3::ConnectAck<Io, SessionLite>,
+    Response = v3::ConnectAck<Io, Session>,
     Error = ServerError,
     InitError = ServerError,
 > {
@@ -84,7 +78,7 @@ fn connect_v3<Io>(
 
                 let (tx, mut rx) = mpsc::unbounded_channel::<Publication>();
 
-                let session = sessions.open_session(client_id.clone(), tx).await;
+                let session = sessions.open_session(client_id.clone(), tx);
                 log::info!("Client {} connected", client_id);
 
                 let sink = connect.sink().clone();
@@ -123,21 +117,22 @@ fn connect_v3<Io>(
 }
 
 fn control_v3(
-    sessions: SessionManagerHandle,
+    sessions: SessionManager,
 ) -> impl ServiceFactory<
-    Config = v3::Session<SessionLite>,
+    Config = v3::Session<Session>,
     Request = v3::ControlPacket,
     Response = v3::ControlResult,
     Error = ServerError,
     InitError = ServerError,
 > {
-    ntex::fn_factory_with_config(move |session: v3::Session<SessionLite>| {
+    ntex::fn_factory_with_config(move |session: v3::Session<Session>| {
         let sessions = sessions.clone();
 
         future::ok(ntex::fn_service(move |req: v3::ControlPacket| {
             let session = session.clone();
             let sessions = sessions.clone();
 
+            // todo remove async
             async move {
                 match req {
                     v3::ControlPacket::Subscribe(mut subscribe) => {
@@ -146,9 +141,7 @@ fn control_v3(
                             .map(|sub| (sub.topic().clone(), from_qos(sub.qos())))
                             .collect();
 
-                        if let Some(acks) =
-                            sessions.subscribe(session.state().client_id(), subs).await
-                        {
+                        if let Some(acks) = sessions.subscribe(session.state().client_id(), subs) {
                             for (mut sub, ack) in subscribe.iter_mut().zip(acks) {
                                 match ack {
                                     Ok(qos) => sub.subscribe(to_qos(qos)),
@@ -169,7 +162,7 @@ fn control_v3(
                     v3::ControlPacket::Disconnect(disconnect) => {
                         // TODO close session
                         let client_id = session.state().client_id();
-                        sessions.close_session(client_id.clone()).await;
+                        sessions.close_session(client_id.clone());
                         log::info!("Client {} disconnected", client_id);
 
                         Ok(disconnect.ack())
@@ -177,7 +170,7 @@ fn control_v3(
                     v3::ControlPacket::Closed(closed) => {
                         // TODO close session
                         let client_id = session.state().client_id();
-                        sessions.close_session(client_id.clone()).await;
+                        sessions.close_session(client_id.clone());
                         log::info!("Client {} closed connection", client_id);
 
                         Ok(closed.ack())
@@ -208,19 +201,55 @@ async fn main() -> std::io::Result<()> {
 
     env_logger::init();
 
-    let sessions = SessionManagerWorker::new();
-    let handle = sessions.handle();
+    // let sessions = SessionManagerWorker::new();
+    // let handle = sessions.handle();
 
-    ntex::rt::spawn(sessions.run());
+    // ntex::rt::spawn(sessions.run());
 
-    ntex::server::Server::build()
+    let (tx, _) = tokio::sync::broadcast::channel(10_0000);
+
+    Server::build()
         .bind("mqtt", "127.0.0.1:1883", move || {
+            let sessions = make_session_manager(tx.clone());
+
             MqttServer::new().v3({
-                v3::MqttServer::new(connect_v3(handle.clone()))
-                    .publish(publish_v3(handle.clone()))
-                    .control(control_v3(handle.clone()))
+                v3::MqttServer::new(connect_v3(sessions.clone()))
+                    .publish(publish_v3(sessions.clone()))
+                    .control(control_v3(sessions))
             })
         })?
         .run()
         .await
 }
+
+fn make_session_manager(sender: tokio::sync::broadcast::Sender<Publication>) -> SessionManager {
+    let manager = SessionManager::new(sender.clone());
+
+    let mut receiver = sender.subscribe();
+    let sessions = manager.clone();
+
+    ntex::rt::spawn(async move {
+        while let Some(publication) = receiver.next().await {
+            match publication {
+                Ok(publication) => {
+                    sessions.dispatch(publication);
+                }
+                Err(RecvError::Closed) => log::info!("Drained all publications"),
+                Err(RecvError::Lagged(lag)) => {
+                    log::error!("Receiver started to lag by {} publications", lag)
+                }
+            }
+        }
+
+        log::info!("Session manager stopped receiving neighboring publications");
+    });
+
+    manager
+}
+
+// [ ] make a session manager per thread
+// [ ] maintain a session locally
+// [ ] when publish don't make a filter but a publist
+// [ ] publish first makes a broadcast to session manager on other threads
+//     then matches topics and dispatch packets to appropriate sinks
+// [ ] make inversed search index { Topic -> [Session] }
