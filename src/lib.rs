@@ -1,9 +1,10 @@
 mod session;
+pub mod v3;
 
 use bytes::Bytes;
 use bytestring::ByteString;
 
-pub use session::{Session, SessionManager};
+pub use session::{OpenSession, Session, SessionManager, SessionState};
 
 #[derive(Clone)]
 pub struct Publication {
