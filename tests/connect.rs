@@ -2,6 +2,7 @@
 
 use bytes::Bytes;
 use bytestring::ByteString;
+use client::MqttConnector;
 use futures_util::{future::ok, FutureExt, SinkExt, StreamExt};
 use ntex_broker::{v3, SessionManager};
 use ntex_codec::Framed;
@@ -17,7 +18,7 @@ async fn connect_transient() {
     });
 
     // connect with clean session
-    let client = client::MqttConnector::new(srv.addr())
+    let client = MqttConnector::new(srv.addr())
         .client_id("client1")
         .clean_session()
         .connect()
@@ -25,18 +26,6 @@ async fn connect_transient() {
         .unwrap();
 
     assert!(!client.session_present());
-
-    // let sink = client.sink();
-
-    // ntex::rt::spawn(client.start_default());
-
-    // let res = sink
-    //     .publish(ByteString::from_static("#"), Bytes::new())
-    //     .send_at_least_once()
-    //     .await;
-    // assert!(res.is_ok());
-
-    // sink.close();
 }
 
 #[ntex::test]
@@ -48,18 +37,7 @@ async fn connect_persistent() {
         v3::server(sessions).finish()
     });
 
-    // connect with persistent session
-    // let io = srv.connect().unwrap();
-    // let mut framed = Framed::new(io, ntex_mqtt::v3::codec::Codec::default());
-    // framed
-    //     .send(ntex_mqtt::v3::codec::Packet::Connect(
-    //         ntex_mqtt::v3::codec::Connect::default().client_id("user"),
-    //     ))
-    //     .await
-    //     .unwrap();
-    // let connack = framed.next().await.unwrap().unwrap();
-    // dbg!(connack);
-    let client = client::MqttConnector::new(srv.addr())
+    let client = MqttConnector::new(srv.addr())
         .client_id("client1")
         .connect()
         .await
@@ -69,26 +47,70 @@ async fn connect_persistent() {
 
     // reconnect and expect session present
     client.sink().close();
-    let client = client::MqttConnector::new(srv.addr())
+    client.start_default().await;
+
+    let client = MqttConnector::new(srv.addr())
         .client_id("client1")
         .connect()
         .await
         .unwrap();
 
     assert!(client.session_present());
-
-    // let sink = client.sink();
-
-    // ntex::rt::spawn(client.start_default());
-
-    // let res = sink
-    //     .publish(ByteString::from_static("#"), Bytes::new())
-    //     .send_at_least_once()
-    //     .await;
-    // assert!(res.is_ok());
-
-    // sink.close();
 }
+
+#[ntex::test]
+async fn disconnect_active_client() {
+    let (tx, _) = tokio::sync::broadcast::channel(10_0000);
+
+    let srv = ntex::server::test_server(move || {
+        let sessions = SessionManager::new(tx.clone());
+        v3::server(sessions).finish()
+    });
+
+    let client1 = MqttConnector::new(srv.addr())
+        .client_id("client1")
+        .connect()
+        .await
+        .unwrap();
+
+    assert!(!client1.session_present());
+
+    let client1_join = ntex::rt::spawn(client1.start_default());
+
+    let client2 = MqttConnector::new(srv.addr())
+        .client_id("client1")
+        .connect()
+        .await
+        .unwrap();
+
+    assert!(!client2.session_present());
+
+    assert!(client1_join.await.is_ok());
+}
+
+// connect with persistent session
+// let io = srv.connect().unwrap();
+// let mut framed = Framed::new(io, ntex_mqtt::v3::codec::Codec::default());
+// framed
+//     .send(ntex_mqtt::v3::codec::Packet::Connect(
+//         ntex_mqtt::v3::codec::Connect::default().client_id("user"),
+//     ))
+//     .await
+//     .unwrap();
+// let connack = framed.next().await.unwrap().unwrap();
+// dbg!(connack);
+
+// let sink = client.sink();
+
+// ntex::rt::spawn(client.start_default());
+
+// let res = sink
+//     .publish(ByteString::from_static("#"), Bytes::new())
+//     .send_at_least_once()
+//     .await;
+// assert!(res.is_ok());
+
+// sink.close();
 
 // #[ntex::test]
 // async fn test_ack_order() -> std::io::Result<()> {

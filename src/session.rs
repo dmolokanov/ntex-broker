@@ -438,7 +438,20 @@ impl SessionManager {
 
         let mut inner = self.0.borrow_mut();
         match inner.sessions.remove(&client_id) {
-            Some(Session::Transient(connected)) | Some(Session::Persistent(connected)) => todo!(),
+            Some(Session::Transient(connected)) | Some(Session::Persistent(connected)) => {
+                debug!("Found existing online session for {}", client_id);
+                let disconnecting = Session::Disconnecting(connected.into_disconnecting());
+                let session = if connect.client_id.is_empty() {
+                    info!("Cleaning offline session for {}", client_id);
+                    Session::new_transient(client_id.clone())
+                } else {
+                    info!("Moving offline session into online for {}", client_id);
+                    Session::Persistent(offline.into_online())
+                };
+
+                inner.sessions.insert(client_id.clone(), session.clone());
+                OpenSession::DuplicateSession(disconnecting, session)
+            }
             Some(Session::Offline(offline)) => {
                 debug!("Found offline session for {}", client_id);
                 let session = if connect.client_id.is_empty() {
