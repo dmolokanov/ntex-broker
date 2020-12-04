@@ -1,10 +1,10 @@
 #![type_length_limit = "152202854"]
 
 use futures_util::{future, StreamExt};
-use ntex::{channel::mpsc, server::Server, ServiceFactory};
+use ntex::{server::Server, ServiceFactory};
 use ntex_broker::{Publication, QualityOfService, Session, SessionManager};
 use ntex_mqtt::{v3, v5, MqttServer};
-use tokio::sync::broadcast::RecvError;
+use tokio::sync::mpsc::{self};
 
 #[derive(Debug)]
 struct ServerError;
@@ -74,7 +74,7 @@ fn connect_v3<Io>(
             async move {
                 let client_id = connect.packet().client_id.clone();
 
-                let (tx, mut rx) = mpsc::channel();
+                let (tx, mut rx) = mpsc::unbounded_channel();
 
                 let session = sessions.open_session(client_id.clone(), tx);
                 log::info!("Client {} connected", client_id);
@@ -139,10 +139,20 @@ fn control_v3(
                             .map(|sub| (sub.topic().clone(), from_qos(sub.qos())))
                             .collect();
 
-                        if let Some(acks) = sessions.subscribe(session.state().client_id(), subs) {
+                        let client_id = session.state().client_id();
+
+                        if let Some(acks) = sessions.subscribe(client_id.clone(), subs) {
                             for (mut sub, ack) in subscribe.iter_mut().zip(acks) {
                                 match ack {
-                                    Ok(qos) => sub.subscribe(to_qos(qos)),
+                                    Ok(qos) => {
+                                        log::info!(
+                                            "Client {} subscribed to \"{}\" with qos {:?}",
+                                            client_id,
+                                            sub.topic(),
+                                            qos
+                                        );
+                                        sub.subscribe(to_qos(qos));
+                                    }
                                     Err(e) => {
                                         panic!("error in topic filter {} {:?}", sub.topic(), e)
                                     }
@@ -204,12 +214,12 @@ async fn main() -> std::io::Result<()> {
 
     // ntex::rt::spawn(sessions.run());
 
-    let (tx, _) = tokio::sync::broadcast::channel(10_0000);
+    // let (tx, _) = tokio::sync::broadcast::channel(10_0000);
 
+    let sessions = SessionManager::new();
     Server::build()
         .bind("mqtt", "0.0.0.0:1883", move || {
-            let sessions = make_session_manager(tx.clone());
-
+            let sessions = sessions.clone();
             MqttServer::new().v3({
                 v3::MqttServer::new(connect_v3(sessions.clone()))
                     .publish(publish_v3(sessions.clone()))
@@ -220,30 +230,30 @@ async fn main() -> std::io::Result<()> {
         .await
 }
 
-fn make_session_manager(sender: tokio::sync::broadcast::Sender<Publication>) -> SessionManager {
-    let manager = SessionManager::new(sender.clone());
+// fn make_session_manager(sender: tokio::sync::broadcast::Sender<Publication>) -> SessionManager {
+//     let manager = SessionManager::new(sender.clone());
 
-    let mut receiver = sender.subscribe();
-    let sessions = manager.clone();
+//     let mut receiver = sender.subscribe();
+//     let sessions = manager.clone();
 
-    ntex::rt::spawn(async move {
-        while let Some(publication) = receiver.next().await {
-            match publication {
-                Ok(publication) => {
-                    sessions.dispatch(publication);
-                }
-                Err(RecvError::Closed) => log::info!("Drained all publications"),
-                Err(RecvError::Lagged(lag)) => {
-                    log::error!("Receiver started to lag by {} publications", lag)
-                }
-            }
-        }
+//     ntex::rt::spawn(async move {
+//         while let Some(publication) = receiver.next().await {
+//             match publication {
+//                 Ok(publication) => {
+//                     sessions.dispatch(publication);
+//                 }
+//                 Err(RecvError::Closed) => log::info!("Drained all publications"),
+//                 Err(RecvError::Lagged(lag)) => {
+//                     log::error!("Receiver started to lag by {} publications", lag)
+//                 }
+//             }
+//         }
 
-        log::info!("Session manager stopped receiving neighboring publications");
-    });
+//         log::info!("Session manager stopped receiving neighboring publications");
+//     });
 
-    manager
-}
+//     manager
+// }
 
 // [x] make a session manager per thread
 // [x] maintain a session locally

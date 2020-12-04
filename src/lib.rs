@@ -5,7 +5,7 @@ use bytestring::ByteString;
 
 pub use session::{Session, SessionManager};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Publication {
     topic: ByteString,
     qos: QualityOfService,
