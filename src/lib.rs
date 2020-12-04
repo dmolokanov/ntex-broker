@@ -3,7 +3,7 @@ mod session;
 use bytes::Bytes;
 use bytestring::ByteString;
 
-pub use session::{Session, SessionManager};
+pub use session::{Session, SessionEvent, SessionManager};
 
 #[derive(Clone)]
 pub struct Publication {

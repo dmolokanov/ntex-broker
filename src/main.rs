@@ -1,8 +1,8 @@
 #![type_length_limit = "152202854"]
 
 use futures_util::{future, StreamExt};
-use ntex::{channel::mpsc, server::Server, ServiceFactory};
-use ntex_broker::{Publication, QualityOfService, Session, SessionManager};
+use ntex::{server::Server, ServiceFactory};
+use ntex_broker::{Publication, QualityOfService, Session, SessionEvent, SessionManager};
 use ntex_mqtt::{v3, v5, MqttServer};
 use tokio::sync::broadcast::RecvError;
 
@@ -74,7 +74,7 @@ fn connect_v3<Io>(
             async move {
                 let client_id = connect.packet().client_id.clone();
 
-                let (tx, mut rx) = mpsc::channel();
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
                 let session = sessions.open_session(client_id.clone(), tx);
                 log::info!("Client {} connected", client_id);
@@ -220,26 +220,32 @@ async fn main() -> std::io::Result<()> {
         .await
 }
 
-fn make_session_manager(sender: tokio::sync::broadcast::Sender<Publication>) -> SessionManager {
+fn make_session_manager(sender: tokio::sync::broadcast::Sender<SessionEvent>) -> SessionManager {
     let manager = SessionManager::new(sender.clone());
 
     let mut receiver = sender.subscribe();
     let sessions = manager.clone();
 
     ntex::rt::spawn(async move {
-        while let Some(publication) = receiver.next().await {
-            match publication {
-                Ok(publication) => {
-                    sessions.dispatch(publication);
+        while let Some(event) = receiver.next().await {
+            match event {
+                Ok(SessionEvent::Connected(client_id, sender)) => {
+                    sessions._open_session(client_id, sender);
                 }
-                Err(RecvError::Closed) => log::info!("Drained all publications"),
+                Ok(SessionEvent::Disconnected(client_id)) => {
+                    sessions._close_session(client_id);
+                }
+                Ok(SessionEvent::Subscribed(client_id, subscribe_to)) => {
+                    sessions._subscribe(client_id, subscribe_to);
+                }
+                Err(RecvError::Closed) => log::info!("Drained all events"),
                 Err(RecvError::Lagged(lag)) => {
-                    log::error!("Receiver started to lag by {} publications", lag)
+                    log::error!("Receiver started to lag by {} events", lag)
                 }
             }
         }
 
-        log::info!("Session manager stopped receiving neighboring publications");
+        log::info!("Session manager stopped receiving neighboring events");
     });
 
     manager

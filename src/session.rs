@@ -2,23 +2,23 @@ use std::{cell::RefCell, cmp, rc::Rc};
 
 use bytestring::ByteString;
 use fxhash::FxHashMap;
-use ntex::channel::mpsc::Sender;
 use ntex_mqtt::{v3::codec::TopicError, Topic};
 use tokio::sync::broadcast::Sender as BroadcastSender;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{Publication, QualityOfService};
 
 struct SessionInner {
     client_id: ByteString,
     subscriptions: FxHashMap<ByteString, Subscription>,
-    sender: Sender<Publication>,
+    sender: UnboundedSender<Publication>,
 }
 
 #[derive(Clone)]
 pub struct Session(Rc<RefCell<SessionInner>>);
 
 impl Session {
-    pub fn new(client_id: ByteString, sender: Sender<Publication>) -> Self {
+    pub fn new(client_id: ByteString, sender: UnboundedSender<Publication>) -> Self {
         Self(Rc::new(RefCell::new(SessionInner {
             client_id,
             sender,
@@ -93,7 +93,7 @@ impl Subscription {
 }
 
 struct SessionManagerInner {
-    broadcast: BroadcastSender<Publication>,
+    broadcast: BroadcastSender<SessionEvent>,
     sessions: FxHashMap<ByteString, Session>,
 }
 
@@ -101,24 +101,59 @@ struct SessionManagerInner {
 pub struct SessionManager(Rc<RefCell<SessionManagerInner>>);
 
 impl SessionManager {
-    pub fn new(sender: BroadcastSender<Publication>) -> Self {
+    pub fn new(sender: BroadcastSender<SessionEvent>) -> Self {
         Self(Rc::new(RefCell::new(SessionManagerInner {
             broadcast: sender,
             sessions: Default::default(),
         })))
     }
 
-    pub fn open_session(&self, client_id: ByteString, sender: Sender<Publication>) -> Session {
+    pub fn open_session(
+        &self,
+        client_id: ByteString,
+        sender: UnboundedSender<Publication>,
+    ) -> Session {
+        let session = self._open_session(client_id.clone(), sender.clone());
+
+        // notify all other managers
+        let inner = self.0.borrow();
+        let event = SessionEvent::Connected(client_id, sender);
+        if inner.broadcast.send(event).is_err() {
+            log::error!("No active session managers found");
+        }
+
+        session
+    }
+
+    pub fn _open_session(
+        &self,
+        client_id: ByteString,
+        sender: UnboundedSender<Publication>,
+    ) -> Session {
         let mut inner = self.0.borrow_mut();
         let _existing = inner.sessions.remove(&client_id);
         // let _existing = sessions.remove(client_id);
 
         let session = Session::new(client_id.clone(), sender);
         inner.sessions.insert(client_id, session.clone());
+
         session
     }
 
     pub fn close_session(&self, client_id: ByteString) -> Option<Session> {
+        let session = self._close_session(client_id.clone());
+
+        // notify all other managers
+        let inner = self.0.borrow();
+        let event = SessionEvent::Disconnected(client_id);
+        if inner.broadcast.send(event).is_err() {
+            log::error!("No active session managers found");
+        }
+
+        session
+    }
+
+    pub fn _close_session(&self, client_id: ByteString) -> Option<Session> {
         let mut inner = self.0.borrow_mut();
         inner.sessions.remove(&client_id)
     }
@@ -128,24 +163,34 @@ impl SessionManager {
         client_id: ByteString,
         subscribe_to: Vec<(ByteString, QualityOfService)>,
     ) -> Option<Vec<Result<QualityOfService, TopicError>>> {
+        let res = self._subscribe(client_id.clone(), subscribe_to.clone());
+
+        // notify all other managers
+        let inner = self.0.borrow();
+        let event = SessionEvent::Subscribed(client_id, subscribe_to);
+        if inner.broadcast.send(event).is_err() {
+            log::error!("No active session managers found");
+        }
+
+        res
+    }
+
+    pub fn _subscribe(
+        &self,
+        client_id: ByteString,
+        subscribe_to: Vec<(ByteString, QualityOfService)>,
+    ) -> Option<Vec<Result<QualityOfService, TopicError>>> {
         let mut inner = self.0.borrow_mut();
 
         inner.sessions.get_mut(&client_id).map(|session| {
             subscribe_to
-                .into_iter()
-                .map(|(topic, qos)| session.subscribe(&topic, qos))
+                .iter()
+                .map(|(topic, qos)| session.subscribe(&topic, *qos))
                 .collect()
         })
     }
 
     pub fn publish(&self, publication: Publication) {
-        let inner = self.0.borrow();
-
-        // notify all other managers
-        if inner.broadcast.send(publication.clone()).is_err() {
-            log::error!("No active session managers found");
-        }
-
         self.dispatch(publication);
     }
 
@@ -166,4 +211,11 @@ impl SessionManager {
             session.publish(publication);
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    Connected(ByteString, UnboundedSender<Publication>),
+    Disconnected(ByteString),
+    Subscribed(ByteString, Vec<(ByteString, QualityOfService)>),
 }
