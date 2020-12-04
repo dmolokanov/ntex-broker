@@ -207,7 +207,7 @@ async fn main() -> std::io::Result<()> {
     let (tx, _) = tokio::sync::broadcast::channel(10_0000);
 
     Server::build()
-        .bind("mqtt", "127.0.0.1:1883", move || {
+        .bind("mqtt", "0.0.0.0:1883", move || {
             let sessions = make_session_manager(tx.clone());
 
             MqttServer::new().v3({
