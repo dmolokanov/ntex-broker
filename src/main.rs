@@ -1,5 +1,13 @@
 #![type_length_limit = "152202854"]
 
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
 use futures_util::{future, StreamExt};
 use ntex::{channel::mpsc, server::Server, ServiceFactory};
 use ntex_broker::{Publication, QualityOfService, Session, SessionManager};
@@ -24,7 +32,7 @@ impl std::convert::TryFrom<ServerError> for v5::PublishAck {
 }
 
 fn publish_v3(
-    sessions: SessionManager,
+    messages: Arc<AtomicU64>,
 ) -> impl ServiceFactory<
     Config = v3::Session<Session>,
     Request = v3::Publish,
@@ -33,24 +41,11 @@ fn publish_v3(
     InitError = ServerError,
 > {
     ntex::fn_factory(move || {
-        let sessions = sessions.clone();
-        future::ok(ntex::fn_service(move |publish: v3::Publish| {
-            let sessions = sessions.clone();
+        let messages = messages.clone();
+        future::ok(ntex::fn_service(move |_: v3::Publish| {
+            let messages = messages.clone();
             async move {
-                let qos = match publish.qos() {
-                    v3::QoS::AtMostOnce => QualityOfService::AtMostOnce,
-                    _ => QualityOfService::AtLeastOnce,
-                };
-
-                let publication = Publication::new(
-                    &publish.packet().topic,
-                    qos,
-                    publish.retain(),
-                    publish.payload(),
-                );
-
-                sessions.publish(publication);
-
+                messages.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
         }))
@@ -204,15 +199,33 @@ async fn main() -> std::io::Result<()> {
 
     // ntex::rt::spawn(sessions.run());
 
+    let messages = Arc::new(AtomicU64::default());
+    ntex::rt::spawn({
+        let messages = messages.clone();
+        async move {
+            let mut now = tokio::time::Instant::now();
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            while let Some(tick) = interval.next().await {
+                let elapsed = tick.duration_since(now);
+                let total = messages.swap(0, Ordering::Relaxed);
+                let ingress = total as f64 / elapsed.as_secs_f64();
+                log::warn!("ingress: {} msg/sec", ingress);
+
+                now = tick;
+            }
+        }
+    });
+
     let (tx, _) = tokio::sync::broadcast::channel(10_0000);
 
     Server::build()
         .bind("mqtt", "0.0.0.0:1883", move || {
             let sessions = make_session_manager(tx.clone());
+            let messages = messages.clone();
 
             MqttServer::new().v3({
                 v3::MqttServer::new(connect_v3(sessions.clone()))
-                    .publish(publish_v3(sessions.clone()))
+                    .publish(publish_v3(messages))
                     .control(control_v3(sessions))
             })
         })?
