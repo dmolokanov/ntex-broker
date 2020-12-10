@@ -4,21 +4,21 @@ use bytestring::ByteString;
 use fxhash::FxHashMap;
 use ntex_mqtt::{v3::codec::TopicError, Topic};
 use tokio::sync::broadcast::Sender as BroadcastSender;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use crate::{Publication, QualityOfService};
 
 struct SessionInner {
     client_id: ByteString,
     subscriptions: FxHashMap<ByteString, Subscription>,
-    sender: UnboundedSender<Publication>,
+    sender: Sender<Publication>,
 }
 
 #[derive(Clone)]
 pub struct Session(Rc<RefCell<SessionInner>>);
 
 impl Session {
-    pub fn new(client_id: ByteString, sender: UnboundedSender<Publication>) -> Self {
+    pub fn new(client_id: ByteString, sender: Sender<Publication>) -> Self {
         Self(Rc::new(RefCell::new(SessionInner {
             client_id,
             sender,
@@ -63,8 +63,8 @@ impl Session {
             })
     }
 
-    pub fn publish(&self, publication: Publication) {
-        if self.0.borrow().sender.send(publication).is_err() {
+    pub async fn publish(&self, publication: Publication) {
+        if self.0.borrow_mut().sender.send(publication).await.is_err() {
             log::error!("Unable to dispatch publication. Receiving part is closed");
         }
     }
@@ -108,11 +108,7 @@ impl SessionManager {
         })))
     }
 
-    pub fn open_session(
-        &self,
-        client_id: ByteString,
-        sender: UnboundedSender<Publication>,
-    ) -> Session {
+    pub fn open_session(&self, client_id: ByteString, sender: Sender<Publication>) -> Session {
         let session = self._open_session(client_id.clone(), sender.clone());
 
         // notify all other managers
@@ -125,11 +121,7 @@ impl SessionManager {
         session
     }
 
-    pub fn _open_session(
-        &self,
-        client_id: ByteString,
-        sender: UnboundedSender<Publication>,
-    ) -> Session {
+    pub fn _open_session(&self, client_id: ByteString, sender: Sender<Publication>) -> Session {
         let mut inner = self.0.borrow_mut();
         let _existing = inner.sessions.remove(&client_id);
         // let _existing = sessions.remove(client_id);
@@ -190,11 +182,11 @@ impl SessionManager {
         })
     }
 
-    pub fn publish(&self, publication: Publication) {
-        self.dispatch(publication);
+    pub async fn publish(&self, publication: Publication) {
+        self.dispatch(publication).await;
     }
 
-    pub fn dispatch(&self, publication: Publication) {
+    pub async fn dispatch(&self, publication: Publication) {
         // filter local subscriptions that matched topic
         let inner = self.0.borrow();
         let sessions = inner.sessions.values().filter_map(|session| {
@@ -208,14 +200,14 @@ impl SessionManager {
             let mut publication = publication.clone();
             publication.qos = qos;
 
-            session.publish(publication);
+            session.publish(publication).await;
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-    Connected(ByteString, UnboundedSender<Publication>),
+    Connected(ByteString, Sender<Publication>),
     Disconnected(ByteString),
     Subscribed(ByteString, Vec<(ByteString, QualityOfService)>),
 }

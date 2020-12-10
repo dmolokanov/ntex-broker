@@ -49,7 +49,7 @@ fn publish_v3(
                     publish.payload(),
                 );
 
-                sessions.publish(publication);
+                sessions.publish(publication).await;
 
                 Ok(())
             }
@@ -74,7 +74,7 @@ fn connect_v3<Io>(
             async move {
                 let client_id = connect.packet().client_id.clone();
 
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
 
                 let session = sessions.open_session(client_id.clone(), tx);
                 log::info!("Client {} connected", client_id);
