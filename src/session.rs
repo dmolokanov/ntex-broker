@@ -63,11 +63,11 @@ impl Session {
             })
     }
 
-    pub async fn publish(&self, publication: Publication) {
-        if self.0.borrow_mut().sender.send(publication).await.is_err() {
-            log::error!("Unable to dispatch publication. Receiving part is closed");
-        }
-    }
+    // pub async fn publish(&self, publication: Publication) {
+    //     if self.0.borrow_mut().sender.send(publication).await.is_err() {
+    //         log::error!("Unable to dispatch publication. Receiving part is closed");
+    //     }
+    // }
 }
 
 struct SubscriptionInner {
@@ -188,19 +188,26 @@ impl SessionManager {
 
     pub async fn dispatch(&self, publication: Publication) {
         // filter local subscriptions that matched topic
-        let inner = self.0.borrow();
-        let sessions = inner.sessions.values().filter_map(|session| {
-            session
-                .filter(&publication.topic, publication.qos)
-                .map(|qos| (qos, session))
-        });
+        let sessions = self
+            .0
+            .borrow()
+            .sessions
+            .values()
+            .filter_map(|session| {
+                session
+                    .filter(&publication.topic, publication.qos)
+                    .map(|qos| (qos, session.0.borrow().sender.clone()))
+            })
+            .collect::<Vec<_>>();
 
         // dispatch a copy of publication to each matched session
-        for (qos, session) in sessions {
+        for (qos, mut session) in sessions {
             let mut publication = publication.clone();
             publication.qos = qos;
 
-            session.publish(publication).await;
+            if session.send(publication).await.is_err() {
+                log::error!("Unable to dispatch publication. Receiving part is closed");
+            }
         }
     }
 }
