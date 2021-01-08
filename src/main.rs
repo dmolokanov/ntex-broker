@@ -57,18 +57,18 @@ fn publish_v3(
     })
 }
 
-fn connect_v3<Io>(
+fn handshake_v3<Io>(
     sessions: SessionManager,
 ) -> impl ServiceFactory<
     Config = (),
-    Request = v3::Connect<Io>,
-    Response = v3::ConnectAck<Io, Session>,
+    Request = v3::Handshake<Io>,
+    Response = v3::HandshakeAck<Io, Session>,
     Error = ServerError,
     InitError = ServerError,
 > {
     ntex::fn_factory(move || {
         let sessions = sessions.clone();
-        future::ok(ntex::fn_service(move |connect: v3::Connect<Io>| {
+        future::ok(ntex::fn_service(move |connect: v3::Handshake<Io>| {
             let sessions = sessions.clone();
 
             async move {
@@ -83,7 +83,7 @@ fn connect_v3<Io>(
 
                 ntex::rt::spawn(async move {
                     while let Some(publication) = rx.next().await {
-                        if sink.ready().await.is_err() {
+                        if !sink.ready().await {
                             log::warn!("Connection is closed");
                             break;
                         }
@@ -95,13 +95,11 @@ fn connect_v3<Io>(
                             publisher = publisher.retain();
                         }
 
-                        match qos {
+                        if let Err(e) = match qos {
                             QualityOfService::AtMostOnce => publisher.send_at_most_once(),
-                            QualityOfService::AtLeastOnce => {
-                                if let Err(e) = publisher.send_at_least_once().await {
-                                    log::error!("Unable to send publish. {}", e);
-                                }
-                            }
+                            QualityOfService::AtLeastOnce => publisher.send_at_least_once().await,
+                        } {
+                            log::error!("Unable to send publish. {}", e);
                         }
                     }
 
@@ -211,7 +209,7 @@ async fn main() -> std::io::Result<()> {
             let sessions = make_session_manager(tx.clone());
 
             MqttServer::new().v3({
-                v3::MqttServer::new(connect_v3(sessions.clone()))
+                v3::MqttServer::new(handshake_v3(sessions.clone()))
                     .publish(publish_v3(sessions.clone()))
                     .control(control_v3(sessions))
             })
