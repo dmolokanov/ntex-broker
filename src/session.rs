@@ -201,7 +201,7 @@ impl SessionManager {
             .collect::<Vec<_>>();
 
         // dispatch a copy of publication to each matched session
-        for (qos, mut session) in sessions {
+        for (qos, session) in sessions {
             let mut publication = publication.clone();
             publication.qos = qos;
 

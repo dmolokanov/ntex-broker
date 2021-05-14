@@ -1,10 +1,10 @@
 #![type_length_limit = "152202854"]
 
-use futures_util::{future, StreamExt};
+use futures_util::future;
 use ntex::{server::Server, ServiceFactory};
 use ntex_broker::{Publication, QualityOfService, Session, SessionEvent, SessionManager};
 use ntex_mqtt::{v3, v5, MqttServer};
-use tokio::sync::broadcast::RecvError;
+use tokio::sync::broadcast::error::RecvError;
 
 #[derive(Debug)]
 struct ServerError;
@@ -37,6 +37,7 @@ fn publish_v3(
         future::ok(ntex::fn_service(move |publish: v3::Publish| {
             let sessions = sessions.clone();
             async move {
+                log::info!("PUBLISH {:?}", publish);
                 let qos = match publish.qos() {
                     v3::QoS::AtMostOnce => QualityOfService::AtMostOnce,
                     _ => QualityOfService::AtLeastOnce,
@@ -79,10 +80,10 @@ fn handshake_v3<Io>(
                 let session = sessions.open_session(client_id.clone(), tx);
                 log::info!("Client {} connected", client_id);
 
-                let sink = connect.sink().clone();
+                let sink = connect.sink();
 
                 ntex::rt::spawn(async move {
-                    while let Some(publication) = rx.next().await {
+                    while let Some(publication) = rx.recv().await {
                         if !sink.ready().await {
                             log::warn!("Connection is closed");
                             break;
@@ -116,7 +117,7 @@ fn control_v3(
     sessions: SessionManager,
 ) -> impl ServiceFactory<
     Config = v3::Session<Session>,
-    Request = v3::ControlPacket,
+    Request = v3::control::ControlMessage,
     Response = v3::ControlResult,
     Error = ServerError,
     InitError = ServerError,
@@ -124,14 +125,14 @@ fn control_v3(
     ntex::fn_factory_with_config(move |session: v3::Session<Session>| {
         let sessions = sessions.clone();
 
-        future::ok(ntex::fn_service(move |req: v3::ControlPacket| {
+        future::ok(ntex::fn_service(move |req: v3::control::ControlMessage| {
             let session = session.clone();
             let sessions = sessions.clone();
 
             // todo remove async
             async move {
                 match req {
-                    v3::ControlPacket::Subscribe(mut subscribe) => {
+                    v3::control::ControlMessage::Subscribe(mut subscribe) => {
                         let subs = subscribe
                             .iter_mut()
                             .map(|sub| (sub.topic().clone(), from_qos(sub.qos())))
@@ -150,12 +151,12 @@ fn control_v3(
 
                         Ok(subscribe.ack())
                     }
-                    v3::ControlPacket::Unsubscribe(unsub) => {
+                    v3::control::ControlMessage::Unsubscribe(unsub) => {
                         // todo unsubscribe
                         Ok(unsub.ack())
                     }
-                    v3::ControlPacket::Ping(ping) => Ok(ping.ack()),
-                    v3::ControlPacket::Disconnect(disconnect) => {
+                    v3::control::ControlMessage::Ping(ping) => Ok(ping.ack()),
+                    v3::control::ControlMessage::Disconnect(disconnect) => {
                         // TODO close session
                         let client_id = session.state().client_id();
                         sessions.close_session(client_id.clone());
@@ -163,7 +164,7 @@ fn control_v3(
 
                         Ok(disconnect.ack())
                     }
-                    v3::ControlPacket::Closed(closed) => {
+                    v3::control::ControlMessage::Closed(closed) => {
                         // TODO close session
                         let client_id = session.state().client_id();
                         sessions.close_session(client_id.clone());
@@ -214,6 +215,7 @@ async fn main() -> std::io::Result<()> {
                     .control(control_v3(sessions))
             })
         })?
+        .workers(1)
         .run()
         .await
 }
@@ -225,8 +227,8 @@ fn make_session_manager(sender: tokio::sync::broadcast::Sender<SessionEvent>) ->
     let sessions = manager.clone();
 
     ntex::rt::spawn(async move {
-        while let Some(event) = receiver.next().await {
-            match event {
+        loop {
+            match receiver.recv().await {
                 Ok(SessionEvent::Connected(client_id, sender)) => {
                     sessions._open_session(client_id, sender);
                 }
@@ -236,7 +238,10 @@ fn make_session_manager(sender: tokio::sync::broadcast::Sender<SessionEvent>) ->
                 Ok(SessionEvent::Subscribed(client_id, subscribe_to)) => {
                     sessions._subscribe(client_id, subscribe_to);
                 }
-                Err(RecvError::Closed) => log::info!("Drained all events"),
+                Err(RecvError::Closed) => {
+                    log::info!("Drained all events");
+                    break;
+                }
                 Err(RecvError::Lagged(lag)) => {
                     log::error!("Receiver started to lag by {} events", lag)
                 }
