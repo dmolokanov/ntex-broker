@@ -5,7 +5,7 @@ use ntex::{server::Server, ServiceFactory};
 use ntex_broker::{Publication, QualityOfService, Session, SessionEvent, SessionManager};
 use ntex_mqtt::{v3, v5, MqttServer};
 use tokio::sync::broadcast::error::RecvError;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 #[derive(Debug)]
 struct ServerError;
@@ -76,7 +76,7 @@ fn handshake_v3<Io>(
             async move {
                 let client_id = connect.packet().client_id.clone();
 
-                let (tx, rx) = tokio::sync::mpsc::channel(10_000);
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
                 let session = sessions.open_session(client_id.clone(), tx);
                 log::info!("Client {} connected", client_id);
@@ -84,7 +84,7 @@ fn handshake_v3<Io>(
                 let sink = connect.sink();
 
                 ntex::rt::spawn(async move {
-                    let publications = ReceiverStream::new(rx);
+                    let publications = UnboundedReceiverStream::new(rx);
                     let mut batches = publications.ready_chunks(1000);
 
                     while let Some(batch) = batches.next().await {

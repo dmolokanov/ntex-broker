@@ -3,22 +3,21 @@ use std::{cell::RefCell, cmp, rc::Rc};
 use bytestring::ByteString;
 use fxhash::FxHashMap;
 use ntex_mqtt::{v3::codec::TopicError, Topic};
-use tokio::sync::broadcast::Sender as BroadcastSender;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::{broadcast::Sender as BroadcastSender, mpsc::UnboundedSender};
 
 use crate::{Publication, QualityOfService};
 
 struct SessionInner {
     client_id: ByteString,
     subscriptions: FxHashMap<ByteString, Subscription>,
-    sender: Sender<Publication>,
+    sender: UnboundedSender<Publication>,
 }
 
 #[derive(Clone)]
 pub struct Session(Rc<RefCell<SessionInner>>);
 
 impl Session {
-    pub fn new(client_id: ByteString, sender: Sender<Publication>) -> Self {
+    pub fn new(client_id: ByteString, sender: UnboundedSender<Publication>) -> Self {
         Self(Rc::new(RefCell::new(SessionInner {
             client_id,
             sender,
@@ -108,7 +107,11 @@ impl SessionManager {
         })))
     }
 
-    pub fn open_session(&self, client_id: ByteString, sender: Sender<Publication>) -> Session {
+    pub fn open_session(
+        &self,
+        client_id: ByteString,
+        sender: UnboundedSender<Publication>,
+    ) -> Session {
         let session = self._open_session(client_id.clone(), sender.clone());
 
         // notify all other managers
@@ -121,7 +124,11 @@ impl SessionManager {
         session
     }
 
-    pub fn _open_session(&self, client_id: ByteString, sender: Sender<Publication>) -> Session {
+    pub fn _open_session(
+        &self,
+        client_id: ByteString,
+        sender: UnboundedSender<Publication>,
+    ) -> Session {
         let mut inner = self.0.borrow_mut();
         let _existing = inner.sessions.remove(&client_id);
         // let _existing = sessions.remove(client_id);
@@ -205,7 +212,7 @@ impl SessionManager {
             let mut publication = publication.clone();
             publication.qos = qos;
 
-            if session.send(publication).await.is_err() {
+            if session.send(publication).is_err() {
                 log::error!("Unable to dispatch publication. Receiving part is closed");
             }
         }
@@ -214,7 +221,7 @@ impl SessionManager {
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-    Connected(ByteString, Sender<Publication>),
+    Connected(ByteString, UnboundedSender<Publication>),
     Disconnected(ByteString),
     Subscribed(ByteString, Vec<(ByteString, QualityOfService)>),
 }
