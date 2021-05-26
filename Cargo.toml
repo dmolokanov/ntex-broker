@@ -6,11 +6,12 @@ edition = "2018"
 
 [dependencies]
 ntex-mqtt = "0.6.7"
-env_logger = "0.8"
-log = "0.4"
-ntex = "0.3"
-futures-util = "0.3"
-fxhash = "0.2"
-bytestring = "1.0"
-bytes = "1.0"
-tokio = { version = "1.6", features = ["sync"] }
+env_logger = "0.8.3"
+log = "0.4.14"
+ntex = "0.3.16"
+futures-util = "0.3.15"
+fxhash = "0.2.1"
+bytestring = "1.0.0"
+bytes = "1.0.1"
+tokio = { version = "1.6.0", features = ["sync"] }
+tokio-stream = "0.1.6"

@@ -1,10 +1,11 @@
 #![type_length_limit = "152202854"]
 
-use futures_util::future;
+use futures_util::{future, StreamExt};
 use ntex::{server::Server, ServiceFactory};
 use ntex_broker::{Publication, QualityOfService, Session, SessionEvent, SessionManager};
 use ntex_mqtt::{v3, v5, MqttServer};
 use tokio::sync::broadcast::error::RecvError;
+use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Debug)]
 struct ServerError;
@@ -75,7 +76,7 @@ fn handshake_v3<Io>(
             async move {
                 let client_id = connect.packet().client_id.clone();
 
-                let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
+                let (tx, rx) = tokio::sync::mpsc::channel(10_000);
 
                 let session = sessions.open_session(client_id.clone(), tx);
                 log::info!("Client {} connected", client_id);
@@ -83,24 +84,31 @@ fn handshake_v3<Io>(
                 let sink = connect.sink();
 
                 ntex::rt::spawn(async move {
-                    while let Some(publication) = rx.recv().await {
-                        if !sink.ready().await {
-                            log::warn!("Connection is closed");
-                            break;
-                        }
+                    let publications = ReceiverStream::new(rx);
+                    let mut batches = publications.ready_chunks(1000);
 
-                        let (topic, qos, retain, payload) = publication.into_parts();
-                        let mut publisher = sink.publish(topic, payload);
+                    while let Some(batch) = batches.next().await {
+                        for publication in batch {
+                            if !sink.ready().await {
+                                log::warn!("Connection is closed");
+                                break;
+                            }
 
-                        if retain {
-                            publisher = publisher.retain();
-                        }
+                            let (topic, qos, retain, payload) = publication.into_parts();
+                            let mut publisher = sink.publish(topic, payload);
 
-                        if let Err(e) = match qos {
-                            QualityOfService::AtMostOnce => publisher.send_at_most_once(),
-                            QualityOfService::AtLeastOnce => publisher.send_at_least_once().await,
-                        } {
-                            log::error!("Unable to send publish. {}", e);
+                            if retain {
+                                publisher = publisher.retain();
+                            }
+
+                            if let Err(e) = match qos {
+                                QualityOfService::AtMostOnce => publisher.send_at_most_once(),
+                                QualityOfService::AtLeastOnce => {
+                                    publisher.send_at_least_once().await
+                                }
+                            } {
+                                log::error!("Unable to send publish. {}", e);
+                            }
                         }
                     }
 
